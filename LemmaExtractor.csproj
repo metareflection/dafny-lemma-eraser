@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>LemmaExtractor</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="LemmaExtractor.cs" />
+  </ItemGroup>
+
+  <!-- Reference Dafny from local clone -->
+  <ItemGroup>
+    <ProjectReference Include="dafny/Source/DafnyCore/DafnyCore.csproj" />
+    <ProjectReference Include="dafny/Source/DafnyDriver/DafnyDriver.csproj" />
+  </ItemGroup>
+
+</Project>
