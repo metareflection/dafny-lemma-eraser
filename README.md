@@ -1,4 +1,4 @@
-# Dafny Benchmark Generator
+# dafny-lemma-eraser
 
 Generate benchmark files from Dafny source files by erasing lemma bodies. Creates two variants:
 
