@@ -35,37 +35,46 @@ LEMMA_EXTRACTOR = os.path.join(
 )
 
 
-def resolve_includes(file_path, visited=None):
-    """Recursively resolve and inline includes, returning the full content."""
-    if visited is None:
-        visited = set()
+def resolve_includes(file_path):
+    """Recursively resolve and inline includes, returning standalone content.
 
-    file_path = os.path.abspath(file_path)
-    if file_path in visited:
-        return ""
-    visited.add(file_path)
+    Each unique file is inlined at most once across the whole tree (Dafny's
+    own `include` directive dedupes the same way). Without this, a file
+    reached via two include paths produces duplicate module definitions and
+    the inlined output won't parse.
+    """
+    visited = set()
 
-    if not os.path.exists(file_path):
-        return f"// [File not found: {file_path}]\n"
+    def _resolve(path):
+        path = os.path.abspath(path)
+        if path in visited:
+            return None  # Already inlined elsewhere in the tree.
+        visited.add(path)
 
-    with open(file_path, 'r') as f:
-        content = f.read()
+        if not os.path.exists(path):
+            return f"// [File not found: {path}]\n"
 
-    base_dir = os.path.dirname(file_path)
-    include_pattern = r'^(\s*)include\s+"([^"]+)"'
+        with open(path, 'r') as f:
+            content = f.read()
 
-    def replace_include(match):
-        indent = match.group(1)
-        include_path = match.group(2)
-        full_path = os.path.normpath(os.path.join(base_dir, include_path))
-        if os.path.exists(full_path):
-            included_content = resolve_includes(full_path, visited.copy())
-            return f"{indent}// === Inlined from {include_path} ===\n{included_content}\n{indent}// === End {include_path} ==="
-        else:
-            return f"{indent}// [Include not found: {include_path}]"
+        base_dir = os.path.dirname(path)
+        include_pattern = r'^(\s*)include\s+"([^"]+)"'
 
-    content = re.sub(include_pattern, replace_include, content, flags=re.MULTILINE)
-    return content
+        def replace_include(match):
+            indent = match.group(1)
+            include_path = match.group(2)
+            full_path = os.path.normpath(os.path.join(base_dir, include_path))
+            if not os.path.exists(full_path):
+                return f"{indent}// [Include not found: {include_path}]"
+            inlined = _resolve(full_path)
+            if inlined is None:
+                return f"{indent}// === {include_path} (already inlined elsewhere) ==="
+            return f"{indent}// === Inlined from {include_path} ===\n{inlined}\n{indent}// === End {include_path} ==="
+
+        return re.sub(include_pattern, replace_include, content, flags=re.MULTILINE)
+
+    result = _resolve(file_path)
+    return result if result is not None else ""
 
 
 def run_lemma_extractor(file_path):
@@ -92,6 +101,11 @@ def extract_lemmas_from_inlined(content):
 
     Returns the list of lemma dicts (with AST-correct bodyStartPos/bodyEndPos
     relative to `content`), or None on failure.
+
+    Lemmas are deduped by source position. Dafny's AST reports inherited
+    lemmas under both the base module and any refining module ("module B
+    refines A"), with identical offsets. Without dedup we'd mutate the same
+    span twice, corrupting trailing content on the second pass.
     """
     with tempfile.NamedTemporaryFile(
         mode='w', suffix='.dfy', delete=False
@@ -103,12 +117,130 @@ def extract_lemmas_from_inlined(content):
         result = run_lemma_extractor(tmp_path)
         if result is None:
             return None
-        return result.get('lemmas', [])
+        lemmas = result.get('lemmas', [])
+
+        # Correct the body span. Dafny's AST can mis-report it for bodies
+        # with no statements (only comments).
+        for l in lemmas:
+            if not l['hasBody']:
+                continue
+            real_start, real_end = correct_body_span(content, l['bodyStartPos'])
+            if real_start < real_end:
+                l['bodyStartPos'] = real_start
+                l['bodyEndPos'] = real_end
+            else:
+                # Could not locate body; treat as no body so we skip it.
+                l['hasBody'] = False
+                l['bodyStartPos'] = -1
+                l['bodyEndPos'] = -1
+
+        # Dedupe by source position. Refinement causes Dafny to report the
+        # same lemma under multiple module names with identical offsets.
+        seen = {}
+        for l in lemmas:
+            key = (l['startPos'], l['endPos'])
+            if key not in seen or (l['hasBody'] and not seen[key]['hasBody']):
+                seen[key] = l
+        return list(seen.values())
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _balance_braces_to_close(content, brace_open):
+    """Starting at content[brace_open] == '{', return the index AFTER the
+    matching '}'. Ignores braces inside strings, line comments, and block
+    comments. Returns len(content) if unbalanced (defensive)."""
+    depth = 0
+    i = brace_open
+    in_str = False
+    in_line_comment = False
+    in_block_comment = False
+    escape_next = False
+    while i < len(content):
+        c = content[i]
+        if escape_next:
+            escape_next = False
+            i += 1
+            continue
+        if in_line_comment:
+            if c == '\n':
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if content[i:i + 2] == '*/':
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if not in_str:
+            if content[i:i + 2] == '//':
+                in_line_comment = True
+                i += 2
+                continue
+            if content[i:i + 2] == '/*':
+                in_block_comment = True
+                i += 2
+                continue
+        if c == '"':
+            in_str = not in_str
+            i += 1
+            continue
+        if c == '\\' and in_str:
+            escape_next = True
+            i += 1
+            continue
+        if in_str:
+            i += 1
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(content)
+
+
+def correct_body_span(content, hint_start):
+    """Dafny's BlockStmt.StartToken can point a few chars INTO the body
+    (skipping the `{`) when the body has only comments and no statements.
+    EndToken can also overshoot to an enclosing module's `}`. We use
+    hint_start only as a locator: search backward (within a small window
+    and skipping whitespace/comments) for the actual `{`, then balance
+    forward to find the matching `}`.
+
+    Returns (real_start, real_end) where real_end is the index AFTER `}`.
+    Falls back to the hint pair if we can't locate a `{` nearby.
+    """
+    # Dafny can also report a hint_start past EOF for some empty bodies. Clamp.
+    clamped = min(hint_start, len(content) - 1) if len(content) > 0 else 0
+    if 0 <= clamped < len(content) and content[clamped] == '{':
+        return clamped, _balance_braces_to_close(content, clamped)
+
+    i = clamped - 1
+    floor = max(0, clamped - 200)
+    while i >= floor:
+        c = content[i]
+        if c == '{':
+            return i, _balance_braces_to_close(content, i)
+        if c.isspace():
+            i -= 1
+            continue
+        # Skip backward through a // line comment by stepping to its start.
+        line_nl = content.rfind('\n', 0, i)
+        line_text = content[line_nl + 1:i + 1] if line_nl >= 0 else content[:i + 1]
+        comment_idx = line_text.find('//')
+        if comment_idx >= 0 and (line_nl + 1 + comment_idx) <= i:
+            i = line_nl
+            continue
+        i -= 1
+    return hint_start, hint_start  # give up — caller treats as no body
 
 
 def find_helper_lemmas(content, lemmas):

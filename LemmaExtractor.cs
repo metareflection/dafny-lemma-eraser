@@ -29,11 +29,21 @@ public static class Extractor
     {
         var lemmas = new List<LemmaInfo>();
 
-        foreach (var module in program.Modules())
+        // When parsing produces resolution errors, Dafny may return a partial
+        // AST with null entries. Iterate defensively so we still emit what we
+        // could parse instead of crashing the whole run.
+        IEnumerable<ModuleDefinition> modules;
+        try { modules = program.Modules().Where(m => m != null).ToList(); }
+        catch { modules = new List<ModuleDefinition>(); }
+
+        foreach (var module in modules)
         {
+            if (module.TopLevelDecls == null) continue;
             foreach (var decl in module.TopLevelDecls)
             {
-                ExtractFromDecl(decl, module.Name, lemmas);
+                if (decl == null) continue;
+                try { ExtractFromDecl(decl, module.Name ?? "", lemmas); }
+                catch { /* skip malformed decl */ }
             }
         }
 
