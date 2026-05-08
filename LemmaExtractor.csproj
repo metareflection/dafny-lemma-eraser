@@ -7,16 +7,25 @@
     <Nullable>enable</Nullable>
     <RootNamespace>LemmaExtractor</RootNamespace>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+
+    <!-- Path to the prebuilt Dafny DLLs. Defaults to the Homebrew layout
+         on macOS. Override via env var DAFNY_LIB_DIR or
+         `dotnet build -p:DafnyLibDir=/path/to/libexec`. -->
+    <DafnyLibDir Condition="'$(DafnyLibDir)' == '' and '$(DAFNY_LIB_DIR)' != ''">$(DAFNY_LIB_DIR)</DafnyLibDir>
+    <DafnyLibDir Condition="'$(DafnyLibDir)' == ''">/opt/homebrew/Cellar/dafny/4.11.0/libexec</DafnyLibDir>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="LemmaExtractor.cs" />
   </ItemGroup>
 
-  <!-- Reference Dafny from local clone -->
+  <!-- Reference all DLLs from the Dafny installation. Wildcard pulls in
+       DafnyCore + DafnyDriver + Boogie + transitive deps without us having
+       to enumerate them. -->
   <ItemGroup>
-    <ProjectReference Include="dafny/Source/DafnyCore/DafnyCore.csproj" />
-    <ProjectReference Include="dafny/Source/DafnyDriver/DafnyDriver.csproj" />
+    <Reference Include="$(DafnyLibDir)/*.dll">
+      <Private>true</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>

@@ -6,9 +6,13 @@ Creates benchmark files from Dafny source files by:
 - Kind 1 (bodies_erased): Erasing all lemma bodies
 - Kind 2 (helpers_removed): Also removing helper lemmas (lemmas called by other lemmas)
 
-Hybrid approach:
-- Uses LemmaExtractor (C#) on original files for accurate lemma detection
-- Uses Python for include inlining and position finding in inlined content
+Pipeline:
+1. Resolve includes textually -> standalone content
+2. Write content to a temp .dfy file
+3. Run the C# LemmaExtractor on the temp file. The extractor uses Dafny's
+   official AST and returns exact byte offsets for each lemma's declaration
+   and body. We trust those positions verbatim.
+4. Erase / remove from right to left so positions stay valid.
 
 Usage:
     python dfy_benchmark.py <pattern> <output_dir_kind1> <output_dir_kind2>
@@ -22,11 +26,13 @@ import os
 import re
 import glob
 import json
+import tempfile
 import subprocess
 from collections import defaultdict
 
-# Path to the LemmaExtractor
-LEMMA_EXTRACTOR = os.path.join(os.path.dirname(__file__), "bin/Debug/net8.0/LemmaExtractor.dll")
+LEMMA_EXTRACTOR = os.path.join(
+    os.path.dirname(__file__), "bin/Debug/net8.0/LemmaExtractor.dll"
+)
 
 
 def resolve_includes(file_path, visited=None):
@@ -36,7 +42,7 @@ def resolve_includes(file_path, visited=None):
 
     file_path = os.path.abspath(file_path)
     if file_path in visited:
-        return ""  # Avoid circular includes
+        return ""
     visited.add(file_path)
 
     if not os.path.exists(file_path):
@@ -46,8 +52,6 @@ def resolve_includes(file_path, visited=None):
         content = f.read()
 
     base_dir = os.path.dirname(file_path)
-
-    # Find all include statements
     include_pattern = r'^(\s*)include\s+"([^"]+)"'
 
     def replace_include(match):
@@ -65,20 +69,14 @@ def resolve_includes(file_path, visited=None):
 
 
 def run_lemma_extractor(file_path):
-    """Run LemmaExtractor on original file and return parsed JSON result."""
+    """Run LemmaExtractor on a file and return parsed JSON result, or None."""
     result = subprocess.run(
         ["dotnet", LEMMA_EXTRACTOR, file_path],
         capture_output=True,
-        text=True
+        text=True,
     )
 
-    if result.returncode != 0:
-        # Check if it's just parse errors but we still got output
-        if result.stdout.strip():
-            try:
-                return json.loads(result.stdout)
-            except json.JSONDecodeError:
-                pass
+    if result.returncode != 0 and not result.stdout.strip():
         print(f"    LemmaExtractor error: {result.stderr}", file=sys.stderr)
         return None
 
@@ -89,341 +87,136 @@ def run_lemma_extractor(file_path):
         return None
 
 
-def find_brace_end(content, start):
-    """Find the matching closing brace, handling nested braces, strings, and comments."""
-    depth = 0
-    i = start
-    in_string = False
-    in_line_comment = False
-    in_block_comment = False
-    escape_next = False
+def extract_lemmas_from_inlined(content):
+    """Write content to a temp .dfy file and run LemmaExtractor on it.
 
-    while i < len(content):
-        c = content[i]
-
-        if escape_next:
-            escape_next = False
-            i += 1
-            continue
-
-        if c == '\\' and in_string:
-            escape_next = True
-            i += 1
-            continue
-
-        if in_line_comment:
-            if c == '\n':
-                in_line_comment = False
-            i += 1
-            continue
-
-        if in_block_comment:
-            if content[i:i+2] == '*/':
-                in_block_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-
-        if not in_string:
-            if content[i:i+2] == '//':
-                in_line_comment = True
-                i += 2
-                continue
-            if content[i:i+2] == '/*':
-                in_block_comment = True
-                i += 2
-                continue
-
-        if c == '"':
-            in_string = not in_string
-            i += 1
-            continue
-
-        if in_string:
-            i += 1
-            continue
-
-        # Track braces (Dafny uses ' in identifiers like s', not for char literals)
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    return -1
-
-
-def find_lemma_in_content(content, lemma_name, module_name, start_from=0):
+    Returns the list of lemma dicts (with AST-correct bodyStartPos/bodyEndPos
+    relative to `content`), or None on failure.
     """
-    Find a lemma by name in the content, returning (decl_start, body_start, body_end).
-    Returns None if not found or if lemma has no body.
-    """
-    # Pattern to find lemma declaration
-    # Handles: lemma, twostate lemma, ghost lemma
-    pattern = rf'\b((?:twostate\s+)?(?:ghost\s+)?lemma)\s+{re.escape(lemma_name)}\s*(?:<[^>]*>)?\s*\('
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.dfy', delete=False
+    ) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
 
-    for match in re.finditer(pattern, content[start_from:]):
-        decl_start = start_from + match.start()
-
-        # Find the closing paren of parameters
-        paren_start = start_from + match.end() - 1
-        paren_depth = 1
-        i = paren_start + 1
-        while i < len(content) and paren_depth > 0:
-            if content[i] == '(':
-                paren_depth += 1
-            elif content[i] == ')':
-                paren_depth -= 1
-            i += 1
-
-        if paren_depth != 0:
-            continue
-
-        # Now find body start - scan for { while skipping signature keywords
-        body_start = -1
-        j = i
-        while j < len(content):
-            c = content[j]
-
-            if c in ' \t\n\r':
-                j += 1
-                continue
-
-            if content[j:j+2] == '//':
-                newline = content.find('\n', j)
-                j = newline + 1 if newline != -1 else len(content)
-                continue
-
-            if content[j:j+2] == '/*':
-                end = content.find('*/', j)
-                j = end + 2 if end != -1 else len(content)
-                continue
-
-            if c == '{':
-                # Check if attribute
-                if j + 1 < len(content) and content[j+1] == ':':
-                    brace_end = find_brace_end(content, j)
-                    j = brace_end + 1 if brace_end != -1 else len(content)
-                    continue
-                body_start = j
-                break
-
-            if c == ';':
-                # No body
-                break
-
-            # Check for new declaration keywords
-            if c.isalpha():
-                word_end = j
-                while word_end < len(content) and (content[word_end].isalnum() or content[word_end] == '_'):
-                    word_end += 1
-                word = content[j:word_end]
-
-                new_decl = ['lemma', 'function', 'method', 'predicate', 'datatype',
-                           'module', 'import', 'class', 'trait', 'const', 'type']
-                if word in new_decl:
-                    break
-
-                j = word_end
-                continue
-
-            j += 1
-
-        if body_start == -1:
-            return (decl_start, -1, -1)  # No body
-
-        body_end = find_brace_end(content, body_start)
-        if body_end == -1:
-            continue
-
-        return (decl_start, body_start, body_end)
-
-    return None
-
-
-def find_all_lemmas_in_content(content, lemma_infos):
-    """
-    Find all lemmas from lemma_infos in the content.
-    Returns list of dicts with name, hasBody, declStart, bodyStart, bodyEnd.
-    """
-    results = []
-    used_positions = set()
-
-    for info in lemma_infos:
-        name = info['name']
-        module = info['moduleName']
-        has_body_from_ast = info['hasBody']
-
-        # Find all occurrences of this lemma name
-        start_from = 0
-        while True:
-            found = find_lemma_in_content(content, name, module, start_from)
-            if found is None:
-                break
-
-            decl_start, body_start, body_end = found
-
-            # Skip if we've already used this position
-            if decl_start in used_positions:
-                start_from = decl_start + 1
-                continue
-
-            has_body = body_start >= 0
-
-            results.append({
-                'name': name,
-                'moduleName': module,
-                'hasBody': has_body,
-                'declStart': decl_start,
-                'bodyStart': body_start,
-                'bodyEnd': body_end
-            })
-            used_positions.add(decl_start)
-            start_from = (body_end if body_end >= 0 else decl_start) + 1
-
-    return results
-
-
-def find_lemma_calls(content, lemmas):
-    """Find which lemmas call which other lemmas."""
-    lemma_names = {l['name'] for l in lemmas if l['hasBody']}
-    calls = defaultdict(set)
-
-    for lemma in lemmas:
-        if not lemma['hasBody']:
-            continue
-
-        body_start = lemma['bodyStart']
-        body_end = lemma['bodyEnd']
-        if body_start < 0 or body_end < 0:
-            continue
-
-        body = content[body_start:body_end]
-        caller = lemma['name']
-
-        for other_name in lemma_names:
-            if other_name == caller:
-                continue
-            call_pattern = rf'\b{re.escape(other_name)}\s*[\(<;]'
-            if re.search(call_pattern, body):
-                calls[caller].add(other_name)
-
-    return calls
+    try:
+        result = run_lemma_extractor(tmp_path)
+        if result is None:
+            return None
+        return result.get('lemmas', [])
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def find_helper_lemmas(content, lemmas):
-    """Find lemmas that are called by other lemmas (helpers)."""
-    calls = find_lemma_calls(content, lemmas)
+    """Return the set of lemma names that are called by other lemmas."""
+    lemma_names = {l['name'] for l in lemmas if l['hasBody']}
     helpers = set()
-    for callees in calls.values():
-        helpers.update(callees)
+    for lemma in lemmas:
+        if not lemma['hasBody']:
+            continue
+        body = content[lemma['bodyStartPos']:lemma['bodyEndPos']]
+        caller = lemma['name']
+        for other in lemma_names:
+            if other == caller:
+                continue
+            if re.search(rf'\b{re.escape(other)}\s*[\(<;]', body):
+                helpers.add(other)
     return helpers
 
 
+def _empty_body_at(content, body_start, body_end):
+    """Replace the body span [body_start, body_end) with `{\\n  }` indented
+    to match the line of the opening brace."""
+    line_start = content.rfind('\n', 0, body_start)
+    indent = ''
+    if line_start != -1:
+        indent_match = re.match(r'^(\s*)', content[line_start + 1:body_start])
+        if indent_match:
+            indent = indent_match.group(1)
+    return content[:body_start] + '{\n' + indent + '}' + content[body_end:]
+
+
+def _remove_decl_at(content, start, body_end):
+    """Cut the declaration span [start, body_end) plus trailing whitespace."""
+    end = body_end
+    while end < len(content) and content[end] in ' \t\n\r':
+        end += 1
+    return content[:start] + content[end:]
+
+
 def erase_lemma_bodies(content, lemmas):
-    """Replace all lemma bodies with empty bodies."""
-    with_bodies = [l for l in lemmas if l['hasBody'] and l['bodyStart'] >= 0]
-    with_bodies.sort(key=lambda l: l['bodyStart'], reverse=True)
-
-    for lemma in with_bodies:
-        body_start = lemma['bodyStart']
-        body_end = lemma['bodyEnd']
-
-        # Find indentation
-        line_start = content.rfind('\n', 0, body_start)
-        if line_start == -1:
-            indent = ''
-        else:
-            indent_match = re.match(r'^(\s*)', content[line_start+1:body_start])
-            indent = indent_match.group(1) if indent_match else ''
-
-        content = content[:body_start] + '{\n' + indent + '}' + content[body_end+1:]
-
+    """Replace all lemma bodies with empty bodies. Right-to-left."""
+    targets = [l for l in lemmas if l['hasBody'] and l['bodyStartPos'] >= 0]
+    targets.sort(key=lambda l: l['bodyStartPos'], reverse=True)
+    for lemma in targets:
+        content = _empty_body_at(
+            content, lemma['bodyStartPos'], lemma['bodyEndPos']
+        )
     return content
 
 
-def remove_helper_lemmas(content, lemmas):
-    """Remove lemmas that are called by other lemmas (helpers)."""
-    helpers = find_helper_lemmas(content, lemmas)
+def remove_helpers_and_erase(content, lemmas, helpers):
+    """One pass: helpers are cut entirely; remaining lemma bodies are emptied.
+    Operations are sorted right-to-left so earlier positions stay valid."""
+    ops = []
+    for lemma in lemmas:
+        if not lemma['hasBody']:
+            continue
+        if lemma['name'] in helpers:
+            ops.append(('remove', lemma['startPos'], lemma['bodyEndPos'], lemma))
+        else:
+            ops.append(('erase', lemma['bodyStartPos'], lemma['bodyEndPos'], lemma))
 
-    if not helpers:
-        return content
+    ops.sort(key=lambda o: o[1], reverse=True)
 
-    to_remove = [l for l in lemmas if l['name'] in helpers and l['hasBody']]
-    to_remove.sort(key=lambda l: l['declStart'], reverse=True)
-
-    for lemma in to_remove:
-        start = lemma['declStart']
-        end = lemma['bodyEnd'] + 1
-
-        # Consume trailing whitespace
-        while end < len(content) and content[end] in ' \t\n\r':
-            end += 1
-
-        content = content[:start] + content[end:]
-
+    for op, start, end, _ in ops:
+        if op == 'remove':
+            content = _remove_decl_at(content, start, end)
+        else:
+            content = _empty_body_at(content, start, end)
     return content
 
 
 def process_file(file_path, output_dir_kind1, output_dir_kind2, processed_files):
     """Process a single Dafny file and create both benchmark versions."""
-    # Run LemmaExtractor on original file to get lemma info
-    result = run_lemma_extractor(file_path)
+    content = resolve_includes(file_path)
+    lemmas = extract_lemmas_from_inlined(content)
 
-    if result is None:
+    if lemmas is None:
         print(f"    ERROR: Could not extract lemmas from {file_path}")
         return False
 
-    lemma_infos = result.get('lemmas', [])
-
-    # Resolve includes to create standalone content
-    content = resolve_includes(file_path)
-
-    # Find all lemmas in the inlined content
-    lemmas = find_all_lemmas_in_content(content, lemma_infos)
-
-    # Generate output filename
     original_name = os.path.basename(file_path)
     dir_name = os.path.basename(os.path.dirname(file_path))
 
     output_name = original_name
     if output_name in processed_files:
         output_name = f"{dir_name}_{original_name}"
-
     processed_files.add(output_name)
 
     kind1_path = os.path.join(output_dir_kind1, output_name)
     kind2_path = os.path.join(output_dir_kind2, output_name)
 
-    # Count stats
-    total_lemmas = len([l for l in lemmas if l['hasBody']])
     helpers = find_helper_lemmas(content, lemmas)
+    total_lemmas = sum(1 for l in lemmas if l['hasBody'])
 
-    # Kind 1: Just erase lemma bodies
     kind1_content = erase_lemma_bodies(content, lemmas)
+    kind2_content = remove_helpers_and_erase(content, lemmas, helpers)
 
-    # Kind 2: Remove helpers, then erase remaining lemma bodies
-    kind2_content = remove_helper_lemmas(content, lemmas)
-    # Re-find lemmas in modified content
-    remaining_infos = [i for i in lemma_infos if i['name'] not in helpers]
-    remaining_lemmas = find_all_lemmas_in_content(kind2_content, remaining_infos)
-    kind2_content = erase_lemma_bodies(kind2_content, remaining_lemmas)
-
-    # Write outputs
     os.makedirs(output_dir_kind1, exist_ok=True)
     os.makedirs(output_dir_kind2, exist_ok=True)
 
     with open(kind1_path, 'w') as f:
         f.write(kind1_content)
-
     with open(kind2_path, 'w') as f:
         f.write(kind2_content)
 
     print(f"  {file_path}")
     print(f"    -> {output_name} ({total_lemmas} lemmas, {len(helpers)} helpers)")
-
     return True
 
 
@@ -442,7 +235,6 @@ def main():
         print("  python dfy_benchmark.py '../dafny-replay/*/*.dfy' bench/bodies_erased bench/helpers_removed")
         sys.exit(1)
 
-    # Check LemmaExtractor exists
     if not os.path.exists(LEMMA_EXTRACTOR):
         print(f"Error: LemmaExtractor not found at {LEMMA_EXTRACTOR}")
         print("Please run: dotnet build LemmaExtractor.csproj")
@@ -453,7 +245,6 @@ def main():
     output_dir_kind2 = sys.argv[3]
 
     files = sorted(glob.glob(pattern))
-
     if not files:
         print(f"No files found matching pattern: {pattern}")
         sys.exit(1)

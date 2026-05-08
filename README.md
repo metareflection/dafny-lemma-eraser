@@ -11,22 +11,23 @@ Helper lemmas are those called by other lemmas. Non-helper lemmas (the "main" le
 
 - Python 3.8+
 - [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
-
-## Setup
-
-Clone the Dafny compiler source (required for AST parsing):
-
-```bash
-git clone --depth 1 https://github.com/dafny-lang/dafny.git
-```
+- A Dafny installation (the extractor links against the prebuilt `DafnyCore.dll` / `DafnyDriver.dll`)
 
 ## Build
-
-Build the LemmaExtractor tool:
 
 ```bash
 dotnet build LemmaExtractor.csproj
 ```
+
+The project references the Dafny DLLs from a Homebrew install (`/opt/homebrew/Cellar/dafny/4.11.0/libexec`) by default. Override via env var or build property if Dafny lives elsewhere:
+
+```bash
+DAFNY_LIB_DIR=/path/to/dafny/libexec dotnet build LemmaExtractor.csproj
+# or
+dotnet build LemmaExtractor.csproj -p:DafnyLibDir=/path/to/dafny/libexec
+```
+
+The first build takes ~1 second — no Dafny source clone needed.
 
 ## Usage
 
@@ -84,12 +85,11 @@ lemma DoPreservesInv(h: History, a: D.Action)
 
 ## How It Works
 
-1. **LemmaExtractor (C#)** parses original Dafny files using the Dafny compiler's AST to accurately identify lemmas
-2. **Python** inlines all `include` statements to create standalone files
-3. **Python** finds lemmas by name in the inlined content and locates their body positions
-4. **Python** erases bodies or removes helper lemmas based on the benchmark type
+1. **Python** inlines all `include` statements into one standalone string and writes it to a temp `.dfy` file.
+2. **LemmaExtractor (C#)** parses that temp file using Dafny's official AST and returns exact byte offsets for each lemma's declaration and body.
+3. **Python** uses those AST offsets to erase bodies (Kind 1) or remove helpers + erase remaining bodies (Kind 2). Mutations are applied right-to-left so positions stay valid.
 
-This hybrid approach ensures accurate lemma detection while handling the complexity of include resolution.
+The C# tool is the single source of truth for "where is the body" — the Python doesn't try to re-find bodies via regex, which previously corrupted spec clauses containing set literals like `m - {p}`.
 
 ## File Naming
 
